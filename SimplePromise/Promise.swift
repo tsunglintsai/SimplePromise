@@ -8,14 +8,25 @@
 
 import Foundation
 
+
 class Promise {
+    enum Resolution {
+        case rejected(Error)
+        case fulfilled
+    }
+    
+    private struct Task {
+        private(set) var runOnMain: Bool = false
+        private(set) var closure: TaskClosure
+    }
+    typealias TaskClosure = ((@escaping (Promise.Resolution) -> Void ) -> Void)
     private var serialQueue = DispatchQueue(label: "com.henry.promise.serial.queue")
-    private var pending = [((completion: @escaping (Bool)->Void ) -> Void)]()
+    private var pending = [Promise.Task]()
     private var done: (() -> Void) = {}
-    private var fail: (() -> Void) = {}
-    private var failed: Bool = false
+    private var fail: ((Error) -> Void) = { (error) in }
+    private var error: Error?
     private var semaphore = DispatchSemaphore(value: 0)
-    static func first(callback: @escaping ((@escaping  (Bool) -> Void ) -> Void)) -> Promise {
+    static func first(callback: @escaping TaskClosure) -> Promise {
         return Promise().then(callback: callback)
     }
     
@@ -25,26 +36,38 @@ class Promise {
         let done = self.done
         var queue = self.pending
         var semaphore = self.semaphore
-        var failed = self.failed
+        var error = self.error
         func resolve() -> () {
             serialQueue.async {
                 while !queue.isEmpty {
-                    if failed {
-                        fail()
+                    if let error = error {
+                        fail(error)
                         queue.removeAll()
                         return
                     }
-                    let closure = queue.removeFirst()
-                    closure() { (success: Bool) in
-                        if !success {
-                            failed = true
+                    let task = queue.removeFirst()
+                    let runClosure = {
+                        task.closure() { (resolution: Promise.Resolution) in
+                            switch resolution {
+                            case .fulfilled:
+                                break
+                            case .rejected(let errorForRejection):
+                                error = errorForRejection
+                            }
+                            semaphore.signal()
                         }
-                        semaphore.signal()
+                        semaphore.wait()
                     }
-                    semaphore.wait()
+                    if task.runOnMain {
+                        DispatchQueue.main.sync {
+                            runClosure()
+                        }
+                    } else {
+                        runClosure()
+                    }
                 }
-                if failed {
-                    fail()
+                if let error = error {
+                    fail(error)
                 } else {
                     done()
                 }
@@ -53,12 +76,17 @@ class Promise {
         return resolve
     }
     
-    func then(callback: @escaping ((@escaping  (Bool)->Void ) -> Void)) -> Promise {
-        self.pending.append(callback)
+    func then(callback: @escaping TaskClosure) -> Promise {
+        self.pending.append(Promise.Task(runOnMain: false, closure: callback))
         return self
     }
     
-    func fail(fail: @escaping (() -> ())) -> Promise {
+    func thenOnMainQueue(callback: @escaping TaskClosure) -> Promise {
+        self.pending.append(Promise.Task(runOnMain: true, closure: callback))
+        return self
+    }
+    
+    func fail(fail: @escaping ((Error) -> ())) -> Promise {
         self.fail = fail
         return self
     }
